@@ -88,6 +88,16 @@ Launch the app and use the prompt pane to ask for changes like:
 - `/clear`
 - `/reset`
 
+## CI and Releases
+
+- Pull requests and pushes to `main` run CI on Linux, Windows, and macOS.
+- Pushing a version tag like `v0.1.0` builds release archives and publishes them as GitHub release assets.
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
 ## Project Structure
 
 ```
