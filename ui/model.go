@@ -43,6 +43,7 @@ type Model struct {
 	toolNames  []string
 	workspace  string
 	modelName  string
+	logo       string
 	transcript []transcriptEntry
 	input      textarea.Model
 	viewport   viewport.Model
@@ -54,7 +55,7 @@ type Model struct {
 	lastError  string
 }
 
-func NewModel(session *lib.Session, workspaceRoot, modelName string, toolNames []string) Model {
+func NewModel(session *lib.Session, workspaceRoot, modelName string, toolNames []string, logo string) Model {
 	input := textarea.New()
 	input.Placeholder = "Ask the agent to inspect, edit, and verify your project..."
 	input.Focus()
@@ -72,6 +73,7 @@ func NewModel(session *lib.Session, workspaceRoot, modelName string, toolNames [
 		toolNames: append([]string(nil), toolNames...),
 		workspace: workspaceRoot,
 		modelName: modelName,
+		logo:      strings.TrimRight(logo, "\n"),
 		input:     input,
 		spinner:   spin,
 		events:    make(chan tea.Msg, 256),
@@ -237,13 +239,26 @@ func (m *Model) renderBanner() string {
 	title := bannerTitleStyle.Render("HUST coding agent")
 	subtitle := bannerSubtitleStyle.Render("Inspect projects, edit files, and verify changes with local commands.")
 	hints := bannerHintStyle.Render("Shortcuts: /help  /tools  /clear  /reset")
+	credit := bannerCreditStyle.Render("from Navis Lab, SoICT with ❤️")
 	workspace := bannerMetaStyle.Render("workspace: " + m.workspace)
+	info := lipgloss.JoinVertical(lipgloss.Left, title, subtitle, hints, credit, workspace)
 
-	return lipgloss.JoinVertical(lipgloss.Left,
-		title,
-		subtitle,
-		hints,
-		workspace,
+	if m.logo == "" {
+		return info
+	}
+
+	logo := bannerLogoColumnStyle.Render(bannerLogoStyle.Render(m.logo))
+	availableWidth := max(20, m.width-10)
+	stackedThreshold := lipgloss.Width(logo) + 32
+	if availableWidth <= stackedThreshold {
+		return lipgloss.JoinVertical(lipgloss.Left, logo, info)
+	}
+
+	infoWidth := max(20, availableWidth-lipgloss.Width(logo)-2)
+	return lipgloss.JoinHorizontal(
+		lipgloss.Top,
+		logo,
+		bannerInfoStyle.Width(infoWidth).Render(info),
 	)
 }
 
@@ -471,9 +486,17 @@ var (
 			Background(lipgloss.Color("235")).
 			Padding(bannerPaddingY, 2).
 			MarginBottom(1)
-	bannerTitleStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("230"))
-	bannerSubtitleStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
-	bannerHintStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("151"))
+	bannerLogoColumnStyle = lipgloss.NewStyle().
+				BorderRight(true).
+				BorderForeground(lipgloss.Color("59")).
+				PaddingRight(2).
+				MarginRight(2)
+	bannerLogoStyle     = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("229"))
+	bannerInfoStyle     = lipgloss.NewStyle().Align(lipgloss.Left)
+	bannerTitleStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("230")).PaddingBottom(1)
+	bannerSubtitleStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("252")).PaddingBottom(1)
+	bannerHintStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("151")).PaddingBottom(1)
+	bannerCreditStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("217")).Bold(true).PaddingBottom(1)
 	bannerMetaStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
 	transcriptStyle     = lipgloss.NewStyle().Padding(0, 1).MarginBottom(1)
 	baseEntryStyle      = lipgloss.NewStyle().MarginBottom(1)

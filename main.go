@@ -1,6 +1,7 @@
 package main
 
 import (
+	_ "embed"
 	"fmt"
 	"os"
 
@@ -9,6 +10,9 @@ import (
 	"github.com/betty/agent/ui"
 	tea "github.com/charmbracelet/bubbletea"
 )
+
+//go:embed logo.txt
+var bannerLogo string
 
 func main() {
 	config, err := lib.LoadConfig()
@@ -42,7 +46,7 @@ func main() {
 
 	session := lib.NewSession(agent)
 	program := tea.NewProgram(
-		ui.NewModel(session, workspace.Root, string(model), toolNames(toolDefinitions)),
+		ui.NewModel(session, workspace.Root, string(model), toolNames(toolDefinitions), bannerLogo),
 		tea.WithMouseCellMotion(),
 	)
 

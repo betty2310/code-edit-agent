@@ -14,7 +14,7 @@ const openRouterBaseURL = "https://openrouter.ai/api/"
 
 var (
 	defaultAnthropicModel  = anthropic.ModelClaudeHaiku4_5
-	defaultOpenRouterModel = anthropic.Model("anthropic/claude-3-haiku")
+	defaultOpenRouterModel = anthropic.Model("anthropic/claude-haiku-4.5")
 )
 
 type Config struct {
