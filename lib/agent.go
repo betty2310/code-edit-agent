@@ -4,77 +4,145 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
+	"time"
 
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/betty/agent/tools"
 )
 
-type Agent struct {
-	Client         *anthropic.Client
-	GetUserMessage func() (string, bool)
-	Tools          []tools.ToolDefinition
+type EventType string
+
+const (
+	EventStatus     EventType = "status"
+	EventAssistant  EventType = "assistant"
+	EventToolCall   EventType = "tool_call"
+	EventToolResult EventType = "tool_result"
+)
+
+type Event struct {
+	Type      EventType
+	Message   string
+	ToolName  string
+	ToolInput string
+	IsError   bool
+	Time      time.Time
 }
 
-func NewAgent(client *anthropic.Client, getUserMessage func() (string, bool), tools []tools.ToolDefinition) *Agent {
+type EventSink func(Event)
+
+type Agent struct {
+	Client         *anthropic.Client
+	Model          anthropic.Model
+	Tools          []tools.ToolDefinition
+	SystemPrompt   string
+	MaxTokens      int64
+	RequestTimeout time.Duration
+}
+
+type Session struct {
+	agent        *Agent
+	mu           sync.Mutex
+	conversation []anthropic.MessageParam
+	running      bool
+}
+
+func NewAgent(client *anthropic.Client, model anthropic.Model, toolDefinitions []tools.ToolDefinition, systemPrompt string, maxTokens int64, requestTimeout time.Duration) *Agent {
 	return &Agent{
 		Client:         client,
-		GetUserMessage: getUserMessage,
-		Tools:          tools,
+		Model:          model,
+		Tools:          toolDefinitions,
+		SystemPrompt:   systemPrompt,
+		MaxTokens:      maxTokens,
+		RequestTimeout: requestTimeout,
 	}
 }
 
-func (a *Agent) Run(ctx context.Context) error {
-	conversation := []anthropic.MessageParam{}
+func NewSession(agent *Agent) *Session {
+	return &Session{agent: agent}
+}
 
-	fmt.Println("Chat with Claude (use Ctrl-c to quit)")
-	readUserInput := true
+func (s *Session) Reset() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.conversation = nil
+	s.running = false
+}
+
+func (s *Session) RunTurn(ctx context.Context, userInput string, sink EventSink) error {
+	s.mu.Lock()
+	if s.running {
+		s.mu.Unlock()
+		return fmt.Errorf("an agent turn is already running")
+	}
+	s.running = true
+	defer func() {
+		s.running = false
+		s.mu.Unlock()
+	}()
+
+	s.emit(sink, Event{Type: EventStatus, Message: "Thinking...", Time: time.Now()})
+	s.conversation = append(s.conversation, anthropic.NewUserMessage(anthropic.NewTextBlock(userInput)))
 
 	for {
-		if readUserInput {
-			fmt.Print("\u001b[94mYou\u001b[0m: ")
-			userInput, ok := a.GetUserMessage()
-			if !ok {
-				break
-			}
-
-			userMessage := anthropic.NewUserMessage(anthropic.NewTextBlock(userInput))
-			conversation = append(conversation, userMessage)
-		}
-		message, err := a.runInFerence(ctx, conversation)
-
+		message, err := s.agent.runInference(ctx, s.conversation)
 		if err != nil {
 			return err
 		}
 
-		conversation = append(conversation, message.ToParam())
+		s.conversation = append(s.conversation, message.ToParam())
 
-		toolResults := []anthropic.ContentBlockParamUnion{}
+		toolResults := make([]anthropic.ContentBlockParamUnion, 0)
+		hasToolUse := false
 
 		for _, content := range message.Content {
 			switch content.Type {
 			case "text":
-				fmt.Printf("\u001b[93mClaude\u001b[0m: %s\n", content.Text)
+				if content.Text != "" {
+					s.emit(sink, Event{Type: EventAssistant, Message: content.Text, Time: time.Now()})
+				}
 			case "tool_use":
-				result := a.executeTool(content.ID, content.Name, content.Input)
+				hasToolUse = true
+				s.emit(sink, Event{
+					Type:      EventToolCall,
+					ToolName:  content.Name,
+					ToolInput: prettifyJSON(content.Input),
+					Message:   fmt.Sprintf("Running %s", content.Name),
+					Time:      time.Now(),
+				})
+				result, event := s.agent.executeTool(ctx, content.ID, content.Name, content.Input)
+				s.emit(sink, event)
 				toolResults = append(toolResults, result)
 			}
 		}
 
-		if len(toolResults) == 0 {
-			readUserInput = true
-			continue
+		if !hasToolUse {
+			s.emit(sink, Event{Type: EventStatus, Message: "Idle", Time: time.Now()})
+			return nil
 		}
 
-		readUserInput = false
-		conversation = append(conversation, anthropic.NewUserMessage(toolResults...))
+		s.conversation = append(s.conversation, anthropic.NewUserMessage(toolResults...))
+		s.emit(sink, Event{Type: EventStatus, Message: "Reviewing tool results...", Time: time.Now()})
 	}
-	return nil
 }
 
-func (a *Agent) runInFerence(ctx context.Context, converstation []anthropic.MessageParam) (*anthropic.Message, error) {
-	anthropicTools := []anthropic.ToolUnionParam{}
+func (s *Session) emit(sink EventSink, event Event) {
+	if sink != nil {
+		sink(event)
+	}
+}
+
+func (a *Agent) runInference(ctx context.Context, conversation []anthropic.MessageParam) (*anthropic.Message, error) {
+	requestCtx := ctx
+	var cancel context.CancelFunc
+	if a.RequestTimeout > 0 {
+		requestCtx, cancel = context.WithTimeout(ctx, a.RequestTimeout)
+		defer cancel()
+	}
+
+	toolParams := make([]anthropic.ToolUnionParam, 0, len(a.Tools))
 	for _, tool := range a.Tools {
-		anthropicTools = append(anthropicTools, anthropic.ToolUnionParam{
+		toolParams = append(toolParams, anthropic.ToolUnionParam{
 			OfTool: &anthropic.ToolParam{
 				Name:        tool.Name,
 				Description: anthropic.String(tool.Description),
@@ -83,36 +151,81 @@ func (a *Agent) runInFerence(ctx context.Context, converstation []anthropic.Mess
 		})
 	}
 
-	message, err := a.Client.Messages.New(ctx, anthropic.MessageNewParams{
-		Model:     anthropic.ModelClaude3_5Haiku20241022,
-		MaxTokens: int64(1024),
-		Messages:  converstation,
-		Tools:     anthropicTools,
-	})
+	params := anthropic.MessageNewParams{
+		Model:       a.Model,
+		MaxTokens:   a.MaxTokens,
+		Messages:    conversation,
+		Tools:       toolParams,
+		Temperature: anthropic.Float(0.2),
+	}
+	if a.SystemPrompt != "" {
+		params.System = []anthropic.TextBlockParam{{Text: a.SystemPrompt}}
+	}
 
-	return message, err
+	return a.Client.Messages.New(requestCtx, params)
 }
 
-func (a *Agent) executeTool(id, name string, input json.RawMessage) anthropic.ContentBlockParamUnion {
-	var toolDef tools.ToolDefinition
-	var found bool
-
-	for _, tool := range a.Tools {
-		if tool.Name == name {
-			toolDef = tool
-			found = true
-			break
+func (a *Agent) executeTool(ctx context.Context, id, name string, input json.RawMessage) (anthropic.ContentBlockParamUnion, Event) {
+	toolDef, found := a.findTool(name)
+	prettyInput := prettifyJSON(input)
+	if !found {
+		return anthropic.NewToolResultBlock(id, "tool not found", true), Event{
+			Type:      EventToolResult,
+			ToolName:  name,
+			ToolInput: prettyInput,
+			Message:   "tool not found",
+			IsError:   true,
+			Time:      time.Now(),
 		}
 	}
 
-	if !found {
-		return anthropic.NewToolResultBlock(id, "tool nout found", true)
+	result, err := toolDef.Function(ctx, input)
+	if err != nil {
+		return anthropic.NewToolResultBlock(id, resultOrFallback(result, err.Error()), true), Event{
+			Type:      EventToolResult,
+			ToolName:  name,
+			ToolInput: prettyInput,
+			Message:   resultOrFallback(result, err.Error()),
+			IsError:   true,
+			Time:      time.Now(),
+		}
 	}
 
-	fmt.Printf("\u001b[92mtool\u001b[0m: %s(%s)\n", name, input)
-	response, err := toolDef.Function(input)
-	if err != nil {
-		return anthropic.NewToolResultBlock(id, err.Error(), true)
+	return anthropic.NewToolResultBlock(id, result, false), Event{
+		Type:      EventToolResult,
+		ToolName:  name,
+		ToolInput: prettyInput,
+		Message:   result,
+		Time:      time.Now(),
 	}
-	return anthropic.NewToolResultBlock(id, response, false)
+}
+
+func (a *Agent) findTool(name string) (tools.ToolDefinition, bool) {
+	for _, tool := range a.Tools {
+		if tool.Name == name {
+			return tool, true
+		}
+	}
+
+	return tools.ToolDefinition{}, false
+}
+
+func prettifyJSON(input json.RawMessage) string {
+	if len(input) == 0 {
+		return "{}"
+	}
+
+	formatted, err := json.MarshalIndent(json.RawMessage(input), "", "  ")
+	if err != nil {
+		return string(input)
+	}
+
+	return string(formatted)
+}
+
+func resultOrFallback(result, fallback string) string {
+	if result != "" {
+		return result
+	}
+	return fallback
 }
